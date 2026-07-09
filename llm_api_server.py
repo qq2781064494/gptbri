@@ -21,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -40,9 +41,44 @@ DEFAULT_API_CHAT_URL = "https://chatgpt.com/"
 DEFAULT_MODEL_NAME = "chatgpt-web"
 DEFAULT_CHAT_CONVERSATION_KEY = "chat"
 DEFAULT_TOOL_CONVERSATION_KEY = "tool"
+DEFAULT_BRIDGE_TIMEOUT_SECONDS = 300
+DEFAULT_REQUEST_SPILLOVER_SECONDS = 120
+DEFAULT_REQUEST_CANCEL_SECONDS = 300
 LOG_PREVIEW_CHARS = 10
 LOG_PREVIEW_BYTES = 8192
 LOG_PREVIEW_CAPTURE_BYTES = 256 * 1024
+DEFAULT_TOOL_PLANNER_PROMPT_PATH = Path(__file__).with_name("tool_planner_prompt.txt")
+DEFAULT_TOOL_PLANNER_PROMPT_TEMPLATE = """你是一个 OpenAI tool calling 下一步决策器。你的任务是根据完整消息上下文、已完成的工具调用结果和工具定义，决定下一步应该继续调用工具，还是给出最终回答，并输出严格 JSON。
+
+决策原则：
+- 不要把“已经有工具结果”当成必须最终回答。
+- 如果当前工具结果还不足以完成用户任务，继续调用最有价值的工具。
+- 如果工具结果已经足够完成任务，输出 final_answer。
+- 不要重复调用已经没有新增信息价值的同一个工具。
+- 如果上一轮工具调用失败、输出为空、被截断或暴露出新的待查信息，可以继续调用工具补齐。
+- 如果用户任务需要修改文件、运行验证、读取更多上下文、查看错误详情，而这些信息还没拿到，应继续调用工具。
+- 不要要求用户提供已经能通过工具获取的信息；不要凭空猜测；不要用“我无法查看”替代工具调用。
+- 如果当前消息已经提供足够证据，或者任务属于闲聊、纯常识、翻译、改写、标题生成、摘要用户已粘贴内容等不需要外部证据的情况，才可以不调用工具直接回答。
+
+硬性要求：
+1. 只输出一个 JSON 对象，不要 Markdown，不要代码块，不要解释。
+2. 如果需要继续调用工具，final_answer 必须是 null。
+3. 如果不需要继续调用工具，tool_calls 必须是空数组。
+4. arguments 必须是对象，参数名必须来自工具 parameters.properties。
+5. 工具调用必须基于完整上下文，不要重新开始任务。
+
+输出格式：
+{"tool_calls":[{"name":"工具名","arguments":{"参数名":参数值}}],"final_answer":null}
+或：
+{"tool_calls":[],"final_answer":"直接回答"}
+
+强制工具名：$forced_name
+
+可用工具 JSON：
+$tools_json
+
+完整请求消息上下文：
+$full_request"""
 
 
 def env_str(name: str, default: str | None = None) -> str | None:
@@ -102,18 +138,147 @@ def model_name() -> str:
     return env_str("BRIDGE_MODEL_NAME", DEFAULT_MODEL_NAME) or DEFAULT_MODEL_NAME
 
 
+def tool_planner_prompt_template() -> str:
+    configured_path = env_str("BRIDGE_TOOL_PLANNER_PROMPT_FILE")
+    path = Path(configured_path).expanduser() if configured_path else DEFAULT_TOOL_PLANNER_PROMPT_PATH
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_TOOL_PLANNER_PROMPT_TEMPLATE
+
+
+def render_tool_planner_prompt(
+    *,
+    forced_name: str | None,
+    tools: list[dict[str, Any]],
+    full_request: str,
+) -> str:
+    return (
+        tool_planner_prompt_template()
+        .replace("$forced_name", forced_name or "无")
+        .replace("$tools_json", json.dumps(tools, ensure_ascii=False))
+        .replace("$full_request", full_request)
+    )
+
+
+@dataclass
+class ConversationSlot:
+    key: str
+    base_key: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    temporary: bool = False
+    active_started_at: float | None = None
+    active_request_id: str | None = None
+
+
 class Runtime:
     def __init__(self) -> None:
         self.bridge: ChatGPTWebBridge | None = None
-        self.locks: dict[str, asyncio.Lock] = {}
+        self.slots: dict[str, ConversationSlot] = {}
+
+    def slot_for(self, conversation_key: str) -> ConversationSlot:
+        key = conversation_key or "default"
+        slot = self.slots.get(key)
+        if slot is None:
+            slot = ConversationSlot(key=key, base_key=key)
+            self.slots[key] = slot
+        return slot
 
     def lock_for(self, conversation_key: str) -> asyncio.Lock:
-        key = conversation_key or "default"
-        lock = self.locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self.locks[key] = lock
-        return lock
+        return self.slot_for(conversation_key).lock
+
+    async def acquire_slot(self, conversation_key: str, request_id: str) -> ConversationSlot:
+        base_slot = self.slot_for(conversation_key)
+        spillover_seconds = max(
+            0,
+            env_int("BRIDGE_REQUEST_SPILLOVER_SECONDS", DEFAULT_REQUEST_SPILLOVER_SECONDS),
+        )
+
+        if spillover_seconds <= 0 or not base_slot.lock.locked():
+            await base_slot.lock.acquire()
+            self.mark_slot_active(base_slot, request_id)
+            return base_slot
+
+        now = time.monotonic()
+        active_started_at = base_slot.active_started_at or now
+        active_age = max(0.0, now - active_started_at)
+        wait_seconds = max(0.0, spillover_seconds - active_age)
+        if wait_seconds > 0:
+            detailed_log(
+                (
+                    "bridge.slot.wait id=%s base_key=%s active_request_id=%s "
+                    "active_age=%.1f wait_seconds=%.1f spillover_seconds=%s"
+                ),
+                request_id,
+                base_slot.key,
+                base_slot.active_request_id,
+                active_age,
+                wait_seconds,
+                spillover_seconds,
+            )
+            try:
+                await asyncio.wait_for(base_slot.lock.acquire(), timeout=wait_seconds)
+                self.mark_slot_active(base_slot, request_id)
+                return base_slot
+            except asyncio.TimeoutError:
+                pass
+
+        if not base_slot.lock.locked():
+            await base_slot.lock.acquire()
+            self.mark_slot_active(base_slot, request_id)
+            return base_slot
+
+        spillover_slot = self.new_spillover_slot(base_slot.key)
+        await spillover_slot.lock.acquire()
+        self.mark_slot_active(spillover_slot, request_id)
+        logger.warning(
+            (
+                "bridge.slot.spillover id=%s base_key=%s slot_key=%s "
+                "active_request_id=%s active_age=%.1f spillover_seconds=%s"
+            ),
+            request_id,
+            base_slot.key,
+            spillover_slot.key,
+            base_slot.active_request_id,
+            active_age,
+            spillover_seconds,
+        )
+        return spillover_slot
+
+    def new_spillover_slot(self, base_key: str) -> ConversationSlot:
+        while True:
+            key = f"{base_key}:spillover:{uuid.uuid4().hex[:8]}"
+            if key not in self.slots:
+                slot = ConversationSlot(key=key, base_key=base_key, temporary=True)
+                self.slots[key] = slot
+                return slot
+
+    @staticmethod
+    def mark_slot_active(slot: ConversationSlot, request_id: str) -> None:
+        slot.active_started_at = time.monotonic()
+        slot.active_request_id = request_id
+
+    def release_slot(self, slot: ConversationSlot) -> None:
+        started_at = slot.active_started_at
+        duration_seconds = time.monotonic() - started_at if started_at else 0.0
+        request_id = slot.active_request_id
+        slot.active_started_at = None
+        slot.active_request_id = None
+        if slot.lock.locked():
+            slot.lock.release()
+        if slot.temporary:
+            self.slots.pop(slot.key, None)
+        detailed_log(
+            (
+                "bridge.slot.release id=%s base_key=%s slot_key=%s temporary=%s "
+                "duration_seconds=%.1f"
+            ),
+            request_id or "-",
+            slot.base_key,
+            slot.key,
+            slot.temporary,
+            duration_seconds,
+        )
 
 
 runtime = Runtime()
@@ -525,8 +690,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reuse_cdp_page=env_bool("BRIDGE_REUSE_CDP_PAGE", True),
         close_extra_chatgpt_pages=env_bool("BRIDGE_CLOSE_EXTRA_CHATGPT_PAGES", True),
         chat_reset_seconds=env_int("BRIDGE_CHAT_RESET_SECONDS", 0),
+        retry_attempts=env_int("BRIDGE_RETRY_ATTEMPTS", 1),
         headless=env_bool("BRIDGE_HEADLESS", False),
-        timeout_ms=env_int("BRIDGE_TIMEOUT_SECONDS", 180) * 1000,
+        timeout_ms=env_int("BRIDGE_TIMEOUT_SECONDS", DEFAULT_BRIDGE_TIMEOUT_SECONDS) * 1000,
     )
     await bridge.__aenter__()
     if env_bool("BRIDGE_PREOPEN_CONVERSATION_PAGES", True):
@@ -634,6 +800,16 @@ async def health() -> dict[str, Any]:
         "model": model_name(),
         "cdp_url": env_str("BRIDGE_CDP_URL", DEFAULT_CDP_URL),
         "chat_reset_seconds": env_int("BRIDGE_CHAT_RESET_SECONDS", 0),
+        "retry_attempts": env_int("BRIDGE_RETRY_ATTEMPTS", 1),
+        "timeout_seconds": env_int("BRIDGE_TIMEOUT_SECONDS", DEFAULT_BRIDGE_TIMEOUT_SECONDS),
+        "request_spillover_seconds": env_int(
+            "BRIDGE_REQUEST_SPILLOVER_SECONDS",
+            DEFAULT_REQUEST_SPILLOVER_SECONDS,
+        ),
+        "request_cancel_seconds": env_int(
+            "BRIDGE_REQUEST_CANCEL_SECONDS",
+            DEFAULT_REQUEST_CANCEL_SECONDS,
+        ),
         "chat_conversation_key": env_str(
             "BRIDGE_CHAT_CONVERSATION_KEY",
             DEFAULT_CHAT_CONVERSATION_KEY,
@@ -739,6 +915,72 @@ async def create_response(payload: dict[str, Any]) -> JSONResponse | StreamingRe
     return JSONResponse(response_payload)
 
 
+async def ask_bridge_with_slot(
+    text: str,
+    images: list[Path],
+    conversation_key: str,
+    force_new_chat: bool,
+    log_label: str,
+) -> str:
+    if runtime.bridge is None:
+        raise ChatGPTBridgeError("Bridge is not ready.")
+
+    slot = await runtime.acquire_slot(conversation_key, log_label)
+    cancel_seconds = max(
+        0,
+        env_int("BRIDGE_REQUEST_CANCEL_SECONDS", DEFAULT_REQUEST_CANCEL_SECONDS),
+    )
+    page_closed = False
+    try:
+        detailed_log(
+            (
+                "bridge.request.start id=%s base_key=%s slot_key=%s temporary=%s "
+                "cancel_seconds=%s prompt_chars=%s images=%s"
+            ),
+            log_label,
+            conversation_key,
+            slot.key,
+            slot.temporary,
+            cancel_seconds,
+            len(text),
+            len(images),
+        )
+        ask_coro = runtime.bridge.ask(
+            text=text,
+            images=images,
+            conversation_key=slot.key,
+            force_new_chat=force_new_chat or slot.temporary,
+            force_new_page=slot.temporary,
+            log_label=log_label,
+        )
+        if cancel_seconds > 0:
+            return await asyncio.wait_for(ask_coro, timeout=cancel_seconds)
+        return await ask_coro
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            (
+                "bridge.request.cancelled id=%s base_key=%s slot_key=%s "
+                "cancel_seconds=%s temporary=%s closing_window=True"
+            ),
+            log_label,
+            conversation_key,
+            slot.key,
+            cancel_seconds,
+            slot.temporary,
+        )
+        if runtime.bridge is not None:
+            await runtime.bridge.close_conversation_page(slot.key, log_label=log_label)
+            page_closed = True
+        raise openai_error(
+            504,
+            f"请求超过 {cancel_seconds} 秒，已取消并关闭 ChatGPT 窗口。",
+        ) from exc
+    finally:
+        if slot.temporary and not page_closed and runtime.bridge is not None:
+            await runtime.bridge.close_conversation_page(slot.key, log_label=log_label)
+        runtime.release_slot(slot)
+
+
 async def complete_chat_request(
     payload: dict[str, Any],
     messages: list[dict[str, Any]],
@@ -765,7 +1007,7 @@ async def complete_chat_request(
         tool_choice,
         force_new_chat,
     )
-    if tools and tool_choice != "none" and not has_tools_result:
+    if tools and tool_choice != "none":
         with tempfile.TemporaryDirectory(prefix="chatgpt_bridge_api_") as tmp_dir:
             prompt, images = await build_prompt_and_images(messages, Path(tmp_dir))
             detailed_log(
@@ -804,10 +1046,7 @@ async def complete_chat_request(
             }
 
     with tempfile.TemporaryDirectory(prefix="chatgpt_bridge_api_") as tmp_dir:
-        if has_tools_result:
-            prompt, images = await build_final_tool_answer_prompt(messages, Path(tmp_dir))
-        else:
-            prompt, images = await build_prompt_and_images(messages, Path(tmp_dir))
+        prompt, images = await build_prompt_and_images(messages, Path(tmp_dir))
         detailed_log(
             "chat.complete.prompt_ready id=%s key=%s prompt_chars=%s images=%s",
             current_request_id(),
@@ -816,30 +1055,29 @@ async def complete_chat_request(
             len(images),
         )
 
-        async with runtime.lock_for(conversation_key):
-            try:
-                detailed_log(
-                    "chat.complete.bridge_call id=%s key=%s prompt_chars=%s images=%s",
-                    current_request_id(),
-                    conversation_key,
-                    len(prompt),
-                    len(images),
-                )
-                reply = await runtime.bridge.ask(
-                    text=isolate_reused_chat_prompt(prompt),
-                    images=images,
-                    conversation_key=conversation_key,
-                    force_new_chat=force_new_chat,
-                    log_label=current_request_id(),
-                )
-                detailed_log(
-                    "chat.complete.bridge_returned id=%s key=%s reply_chars=%s",
-                    current_request_id(),
-                    conversation_key,
-                    len(reply),
-                )
-            except ChatGPTBridgeError as exc:
-                raise openai_error(502, str(exc)) from exc
+        try:
+            detailed_log(
+                "chat.complete.bridge_call id=%s key=%s prompt_chars=%s images=%s",
+                current_request_id(),
+                conversation_key,
+                len(prompt),
+                len(images),
+            )
+            reply = await ask_bridge_with_slot(
+                text=isolate_reused_chat_prompt(prompt),
+                images=images,
+                conversation_key=conversation_key,
+                force_new_chat=force_new_chat,
+                log_label=current_request_id(),
+            )
+            detailed_log(
+                "chat.complete.bridge_returned id=%s key=%s reply_chars=%s",
+                current_request_id(),
+                conversation_key,
+                len(reply),
+            )
+        except ChatGPTBridgeError as exc:
+            raise openai_error(502, str(exc)) from exc
 
     unwrapped_reply = unwrap_planner_final_answer(reply)
     detailed_log(
@@ -1349,44 +1587,22 @@ async def plan_tool_calls_with_web(
         return [], None
 
     full_request = (request_prompt or "").strip() or latest_user_text(messages)
-    planner_prompt = (
-        "你是一个 OpenAI tool calling 规划器。你的任务是根据用户问题和工具定义，"
-        "判断是否需要调用工具，并输出严格 JSON。\n\n"
-        "工具调用判断原则：\n"
-        "- 先判断当前用户问题是否缺少回答所需证据，而不是先寻找直接回答的理由。\n"
-        "- 只要缺少当前项目、代码库、文件、目录、运行结果、系统状态、网页、图片、时间"
-        "或其他当前/外部事实，并且可用工具能够获取或验证这些事实，就必须调用最相关的工具。\n"
-        "- 工具调用的目标是补齐缺失证据：优先选择能直接读取、搜索、执行、观察或验证"
-        "缺失信息的工具。\n"
-        "- 不要要求用户提供已经能通过工具获取的信息；不要凭空猜测；不要用“我无法查看”"
-        "替代工具调用。\n"
-        "- 只有当前消息已经提供足够证据，或者任务属于闲聊、纯常识、翻译、改写、标题生成、"
-        "摘要用户已粘贴内容等不需要外部证据的情况，才可以不调用工具直接回答。\n\n"
-        "硬性要求：\n"
-        "1. 只输出一个 JSON 对象，不要 Markdown，不要代码块，不要解释。\n"
-        "2. 如果需要调用工具，final_answer 必须是 null。\n"
-        "3. 如果不需要调用工具，tool_calls 必须是空数组。\n"
-        "4. arguments 必须是对象，参数名必须来自工具 parameters.properties。\n\n"
-        "输出格式：\n"
-        '{"tool_calls":[{"name":"工具名","arguments":{"参数名":参数值}}],"final_answer":null}\n'
-        "或：\n"
-        '{"tool_calls":[],"final_answer":"直接回答"}\n\n'
-        f"强制工具名：{forced_name or '无'}\n\n"
-        f"可用工具 JSON：\n{json.dumps(tools, ensure_ascii=False)}\n\n"
-        f"完整请求消息上下文：\n{full_request}"
+    planner_prompt = render_tool_planner_prompt(
+        forced_name=forced_name,
+        tools=tools,
+        full_request=full_request,
     )
 
-    async with runtime.lock_for(conversation_key):
-        try:
-            reply = await runtime.bridge.ask(
-                text=isolate_reused_chat_prompt(planner_prompt),
-                images=request_images or [],
-                conversation_key=conversation_key,
-                force_new_chat=force_new_chat,
-                log_label=current_request_id(),
-            )
-        except ChatGPTBridgeError:
-            return [], None
+    try:
+        reply = await ask_bridge_with_slot(
+            text=isolate_reused_chat_prompt(planner_prompt),
+            images=request_images or [],
+            conversation_key=conversation_key,
+            force_new_chat=force_new_chat,
+            log_label=current_request_id(),
+        )
+    except ChatGPTBridgeError:
+        return [], None
 
     payload = parse_json_object(reply)
     if not payload:

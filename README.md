@@ -96,9 +96,14 @@ BRIDGE_CHAT_URL=https://chatgpt.com/
 BRIDGE_REUSE_CDP_PAGE=1
 BRIDGE_CLOSE_EXTRA_CHATGPT_PAGES=1
 BRIDGE_CHAT_RESET_SECONDS=1800
+BRIDGE_RETRY_ATTEMPTS=1
+BRIDGE_TIMEOUT_SECONDS=300
+BRIDGE_REQUEST_SPILLOVER_SECONDS=120
+BRIDGE_REQUEST_CANCEL_SECONDS=300
 BRIDGE_PREOPEN_CONVERSATION_PAGES=1
 BRIDGE_CHAT_CONVERSATION_KEY=chat
 BRIDGE_TOOL_CONVERSATION_KEY=tool
+BRIDGE_TOOL_PLANNER_PROMPT_FILE=/Users/weijiaxin/Documents/pythonwork/gptbri/tool_planner_prompt.txt
 ```
 
 两组变量的分工：
@@ -141,6 +146,10 @@ curl http://127.0.0.1:8011/health
   "model": "chatgpt-web",
   "cdp_url": "http://127.0.0.1:9222",
   "chat_reset_seconds": 1800,
+  "retry_attempts": 1,
+  "timeout_seconds": 300,
+  "request_spillover_seconds": 120,
+  "request_cancel_seconds": 300,
   "chat_conversation_key": "chat",
   "tool_conversation_key": "tool"
 }
@@ -354,9 +363,14 @@ print(resp.choices[0].message.content)
 | `BRIDGE_CHAT_CONVERSATION_KEY` | `chat` | 普通聊天使用的对话槽名称 |
 | `BRIDGE_TOOL_CONVERSATION_KEY` | `tool` | 工具调用使用的对话槽名称 |
 | `BRIDGE_CHAT_RESET_SECONDS` | `0` | 每个对话槽多久后重开；`.env.example` 建议 `1800` |
-| `BRIDGE_TIMEOUT_SECONDS` | `180` | 单次网页请求等待时间 |
+| `BRIDGE_RETRY_ATTEMPTS` | `1` | 回复为空或网页自动化失败后，打开新标签页重试的次数；`0` 表示不重试 |
+| `BRIDGE_TIMEOUT_SECONDS` | `300` | 单次网页自动化等待时间，建议不小于 `BRIDGE_REQUEST_CANCEL_SECONDS` |
+| `BRIDGE_REQUEST_SPILLOVER_SECONDS` | `120` | 某个对话槽内请求占用超过多少秒后，后续请求改用临时新窗口处理；`0` 表示一直等待原槽 |
+| `BRIDGE_REQUEST_CANCEL_SECONDS` | `300` | 单个请求超过多少秒后硬取消，并关闭它占用的 ChatGPT 窗口；`0` 表示不做 API 层硬取消 |
+| `BRIDGE_RESPONSE_FORCE_RETURN_STABLE_SECONDS` | `20` | 回复文本长时间不变时的强制返回阈值，避免网页完成状态识别失败时一直卡住 |
 | `BRIDGE_MAX_IMAGE_MB` | `25` | 单张图片大小上限 |
 | `BRIDGE_USE_LOCAL_TOOL_FALLBACK` | `0` | 工具 JSON 规划失败时是否启用本地规则兜底 |
+| `BRIDGE_TOOL_PLANNER_PROMPT_FILE` | `tool_planner_prompt.txt` | 工具调用规划提示词模板路径；支持 `$forced_name`、`$tools_json`、`$full_request` 占位符 |
 | `BRIDGE_LOG_LEVEL` | `INFO` | 服务日志级别；默认会记录每次请求的接收时间、返回时间、状态码、耗时，以及请求/响应内容的前 10 个字和后 10 个字 |
 | `BRIDGE_DETAILED_LOGS` | `0` | 是否打印浏览器 DOM、等待状态、路由内部阶段等详细排查日志；平时保持关闭，需要定位卡点时设为 `1` |
 
@@ -498,6 +512,7 @@ BRIDGE_TOOL_CONVERSATION_KEY=tool
 ```
 
 然后重启 API 服务。正常情况下只会保留普通聊天和工具调用两个托管标签页。
+如果某个槽位请求超过 `BRIDGE_REQUEST_SPILLOVER_SECONDS` 仍未结束，后续请求会临时打开新标签页处理；临时标签页完成后会自动关闭。如果请求超过 `BRIDGE_REQUEST_CANCEL_SECONDS`，服务会取消该请求并关闭它占用的标签页。
 
 ### 请求返回旧上下文或旧图片内容
 

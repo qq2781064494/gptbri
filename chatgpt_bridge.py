@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -55,6 +56,13 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
 def detailed_logs_enabled() -> bool:
     return env_bool("BRIDGE_DETAILED_LOGS", False)
 
@@ -62,6 +70,13 @@ def detailed_logs_enabled() -> bool:
 def detailed_log(message: str, *args: Any) -> None:
     if detailed_logs_enabled():
         logger.info(message, *args)
+
+
+def response_force_return_stable_seconds() -> float:
+    return env_float(
+        "BRIDGE_RESPONSE_FORCE_RETURN_STABLE_SECONDS",
+        RESPONSE_FORCE_RETURN_STABLE_SECONDS,
+    )
 
 COMPOSER_SELECTORS = [
     'div[contenteditable="true"][role="textbox"]',
@@ -104,7 +119,7 @@ ASSISTANT_DONE_SELECTORS = [
 ]
 
 RESPONSE_STABLE_SECONDS = 2.0
-RESPONSE_FORCE_RETURN_STABLE_SECONDS = 5.0
+RESPONSE_FORCE_RETURN_STABLE_SECONDS = 20.0
 RESPONSE_TRACE_LOG_INTERVAL_SECONDS = 2.0
 LOG_TEXT_PREVIEW_CHARS = 120
 EXISTING_USER_MARK_ATTR = "data-chatgpt-bridge-existing-user"
@@ -113,6 +128,12 @@ ASSISTANT_MESSAGE_SELECTORS = [
     '[data-message-author-role="assistant"]',
     '[data-testid*="conversation-turn"] [data-message-author-role="assistant"]',
     'article:has([data-message-author-role="assistant"])',
+]
+
+FINAL_ASSISTANT_CONTENT_SELECTORS = [
+    ".markdown",
+    '[data-testid="markdown"]',
+    ".prose",
 ]
 
 DISMISS_MODAL_BUTTON_SELECTORS = [
@@ -363,15 +384,19 @@ async def last_assistant_text(page: Page) -> str:
         return ""
 
     try:
-        markdown = message.locator(".markdown").last
-        if await markdown.count():
-            text = await markdown.inner_text(timeout=1000)
-        else:
-            text = await message.inner_text(timeout=1000)
-
-        text = cleanup_chatgpt_text(text)
-        if text:
-            return text
+        for selector in FINAL_ASSISTANT_CONTENT_SELECTORS:
+            content = message.locator(selector)
+            try:
+                count = await content.count()
+            except PlaywrightError:
+                continue
+            for index in range(count - 1, -1, -1):
+                try:
+                    text = cleanup_chatgpt_text(await content.nth(index).inner_text(timeout=1000))
+                except PlaywrightError:
+                    continue
+                if text:
+                    return text
     except PlaywrightError:
         pass
 
@@ -437,6 +462,8 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
     """Return the assistant state belonging to the latest unmarked user turn."""
     empty = {
         "text": "",
+        "raw_text": "",
+        "has_final_content": False,
         "last_user_text": "",
         "last_user_is_existing": True,
         "has_assistant_after_last_user": False,
@@ -448,12 +475,45 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
 
     try:
         state = await page.evaluate(
-            """({doneSelectors, existingUserAttr}) => {
+            """({doneSelectors, existingUserAttr, finalContentSelectors}) => {
                 const textOf = el => {
                     if (!el) return "";
-                    const markdown = el.querySelector(".markdown");
-                    const target = markdown || el;
-                    return target.innerText || target.textContent || "";
+                    return el.innerText || el.textContent || "";
+                };
+                const finalContentNodesOf = el => {
+                    if (!el) return [];
+
+                    for (const selector of finalContentSelectors) {
+                        let nodes = [];
+                        try {
+                            nodes = Array.from(el.querySelectorAll(selector));
+                        } catch {
+                            nodes = [];
+                        }
+                        const uniqueNodes = [];
+                        for (const node of nodes) {
+                            if (!textOf(node).trim()) {
+                                continue;
+                            }
+                            if (uniqueNodes.some(existing => existing === node || existing.contains(node))) {
+                                continue;
+                            }
+                            for (let index = uniqueNodes.length - 1; index >= 0; index -= 1) {
+                                if (node.contains(uniqueNodes[index])) {
+                                    uniqueNodes.splice(index, 1);
+                                }
+                            }
+                            uniqueNodes.push(node);
+                        }
+                        if (uniqueNodes.length) {
+                            return uniqueNodes;
+                        }
+                    }
+
+                    return [];
+                };
+                const finalTextOf = el => {
+                    return finalContentNodesOf(el).map(textOf).join("\\n\\n");
                 };
                 const isVisible = el => {
                     if (!el || el.hidden || el.getAttribute("aria-hidden") === "true") {
@@ -504,11 +564,13 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
                     }
                     assistant = roleNodes[index];
                     assistantIndex = index;
-                    if (textOf(assistant).trim()) {
+                    if (finalTextOf(assistant).trim() || textOf(assistant).trim()) {
                         break;
                     }
                 }
 
+                const finalText = finalTextOf(assistant);
+                const rawText = textOf(assistant);
                 const turn = assistant ? turnOf(assistant) : null;
                 const assistantDone = !!turn && doneSelectors.some(selector => {
                     try {
@@ -519,7 +581,9 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
                 });
 
                 return {
-                    text: textOf(assistant),
+                    text: finalText,
+                    raw_text: rawText,
+                    has_final_content: !!finalText.trim(),
                     last_user_text: textOf(lastUser),
                     last_user_is_existing: !lastUser
                         || lastUser.getAttribute(existingUserAttr) === "1",
@@ -535,6 +599,7 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
             {
                 "doneSelectors": ASSISTANT_DONE_SELECTORS,
                 "existingUserAttr": EXISTING_USER_MARK_ATTR,
+                "finalContentSelectors": FINAL_ASSISTANT_CONTENT_SELECTORS,
             },
         )
     except PlaywrightError:
@@ -545,6 +610,8 @@ async def current_turn_response_state(page: Page) -> dict[str, Any]:
 
     return {
         "text": cleanup_chatgpt_text(str(state.get("text") or "")),
+        "raw_text": cleanup_chatgpt_text(str(state.get("raw_text") or "")),
+        "has_final_content": bool(state.get("has_final_content")),
         "last_user_text": cleanup_chatgpt_text(str(state.get("last_user_text") or "")),
         "last_user_is_existing": bool(state.get("last_user_is_existing", True)),
         "has_assistant_after_last_user": bool(state.get("has_assistant_after_last_user")),
@@ -559,12 +626,52 @@ async def chat_dom_snapshot(page: Page, limit: int = 8) -> dict[str, Any]:
     """Return a compact snapshot of the latest ChatGPT role nodes."""
     try:
         snapshot = await page.evaluate(
-            """({existingUserAttr, limit}) => {
+            """({existingUserAttr, finalContentSelectors, limit}) => {
                 const textOf = el => {
                     if (!el) return "";
-                    const markdown = el.querySelector(".markdown");
-                    const target = markdown || el;
-                    return (target.innerText || target.textContent || "").replace(/\\s+/g, " ").trim();
+                    return (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+                };
+                const finalContentNodesOf = el => {
+                    if (!el) return [];
+
+                    for (const selector of finalContentSelectors) {
+                        let nodes = [];
+                        try {
+                            nodes = Array.from(el.querySelectorAll(selector));
+                        } catch {
+                            nodes = [];
+                        }
+                        const uniqueNodes = [];
+                        for (const node of nodes) {
+                            if (!textOf(node)) {
+                                continue;
+                            }
+                            if (uniqueNodes.some(existing => existing === node || existing.contains(node))) {
+                                continue;
+                            }
+                            for (let index = uniqueNodes.length - 1; index >= 0; index -= 1) {
+                                if (node.contains(uniqueNodes[index])) {
+                                    uniqueNodes.splice(index, 1);
+                                }
+                            }
+                            uniqueNodes.push(node);
+                        }
+                        if (uniqueNodes.length) {
+                            return uniqueNodes;
+                        }
+                    }
+
+                    return [];
+                };
+                const finalTextOf = el => finalContentNodesOf(el).map(textOf).join("\\n\\n").trim();
+                const tailOf = text => text.slice(Math.max(0, text.length - 80));
+                const headOf = text => text.slice(0, 80);
+                const hasSelector = (el, selector) => {
+                    try {
+                        return !!el && !!el.querySelector(selector);
+                    } catch {
+                        return false;
+                    }
                 };
                 const turnOf = el => {
                     let current = el;
@@ -588,14 +695,20 @@ async def chat_dom_snapshot(page: Page, limit: int = 8) -> dict[str, Any]:
                 const nodes = roleNodes.slice(start).map((el, offset) => {
                     const rect = el.getBoundingClientRect();
                     const turn = turnOf(el);
-                    const text = textOf(el);
+                    const rawText = textOf(el);
+                    const finalText = finalTextOf(el);
                     return {
                         index: start + offset,
                         role: el.getAttribute("data-message-author-role") || "",
                         existing_user: el.getAttribute(existingUserAttr) === "1",
-                        text_len: text.length,
-                        text_head: text.slice(0, 80),
-                        text_tail: text.slice(Math.max(0, text.length - 80)),
+                        has_final_content: !!finalText,
+                        text_len: finalText.length,
+                        text_head: headOf(finalText),
+                        text_tail: tailOf(finalText),
+                        raw_text_len: rawText.length,
+                        raw_text_head: headOf(rawText),
+                        raw_text_tail: tailOf(rawText),
+                        final_selectors: finalContentSelectors.filter(selector => hasSelector(el, selector)),
                         visible: rect.width > 0 && rect.height > 0,
                         tag: el.tagName.toLowerCase(),
                         testid: el.getAttribute("data-testid") || "",
@@ -609,7 +722,11 @@ async def chat_dom_snapshot(page: Page, limit: int = 8) -> dict[str, Any]:
                     nodes,
                 };
             }""",
-            {"existingUserAttr": EXISTING_USER_MARK_ATTR, "limit": limit},
+            {
+                "existingUserAttr": EXISTING_USER_MARK_ATTR,
+                "finalContentSelectors": FINAL_ASSISTANT_CONTENT_SELECTORS,
+                "limit": limit,
+            },
         )
     except PlaywrightError as exc:
         return {"error": str(exc)}
@@ -664,6 +781,35 @@ def request_text_matches_user(sent_text: str, user_text: str) -> bool:
     return head in user and tail in user
 
 
+def is_transient_response_text(text: str) -> bool:
+    """Return true for ChatGPT progress placeholders, not usable answers."""
+    compacted = compact_for_match(text).strip()
+    if not compacted:
+        return False
+
+    collapsed = re.sub(r"\s+", "", compacted).strip("。.!！…")
+    lower_compacted = compacted.lower().strip(" .!…")
+    lower_collapsed = collapsed.lower()
+
+    chinese_patterns = [
+        r"^正在(思考|生成|搜索|检索|读取|加载|上传|处理)$",
+        r"^正在(分析|处理|读取|识别|查看|加载|上传)\d*(幅|张|个|份)?(图片|图像|文件|附件)$",
+        r"^(分析|处理|读取|识别|查看|加载|上传)中$",
+    ]
+    if any(re.fullmatch(pattern, collapsed) for pattern in chinese_patterns):
+        return True
+
+    english_patterns = [
+        r"^(thinking|working|generating|searching|reading|loading|uploading|processing)$",
+        r"^(analyzing|processing|reading|loading|uploading)\d*(image|images|file|files|attachment|attachments)$",
+        r"^(analyzing|processing|reading|loading|uploading)(an)?\d*(image|images|file|files|attachment|attachments)$",
+    ]
+    return any(re.fullmatch(pattern, lower_collapsed) for pattern in english_patterns) or (
+        lower_compacted.startswith(("analyzing ", "processing ", "reading "))
+        and lower_compacted.endswith((" image", " images", " file", " files", " attachment", " attachments"))
+    )
+
+
 def cleanup_chatgpt_text(text: str) -> str:
     """Remove common UI fragments that can appear in extracted ChatGPT text."""
     lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
@@ -715,10 +861,13 @@ async def wait_for_response(
 
     while time.monotonic() < deadline:
         current_state = await current_turn_response_state(page)
-        text = str(current_state.get("text") or "")
+        final_text = str(current_state.get("text") or "")
+        raw_text = str(current_state.get("raw_text") or "")
         user_text = str(current_state.get("last_user_text") or "")
         count = await assistant_message_count(page)
         user_matches = request_text_matches_user(sent_text, user_text)
+        has_assistant_after_user = bool(current_state.get("has_assistant_after_last_user"))
+        assistant_done = bool(current_state.get("assistant_done"))
         current_user_ready = (
             not current_state.get("last_user_is_existing", True)
             and (
@@ -726,19 +875,35 @@ async def wait_for_response(
                 or (not requires_user_match and bool(user_text))
             )
         )
+        has_final_content = bool(current_state.get("has_final_content")) and bool(final_text)
+        raw_text_is_transient = is_transient_response_text(raw_text)
+        raw_fallback_usable = (
+            not has_final_content
+            and current_user_ready
+            and has_assistant_after_user
+            and assistant_done
+            and bool(raw_text)
+            and not raw_text_is_transient
+        )
+        text = final_text if has_final_content else (raw_text if raw_fallback_usable else "")
+        text_is_transient = is_transient_response_text(text)
+        current_turn_has_assistant = current_user_ready and has_assistant_after_user
         current_turn_has_text = (
-            current_user_ready
-            and bool(current_state.get("has_assistant_after_last_user"))
+            current_turn_has_assistant
             and bool(text)
+            and not text_is_transient
         )
 
         if not text and not current_user_ready:
-            text = await last_assistant_text(page)
+            fallback_text = await last_assistant_text(page)
+            if fallback_text and not is_transient_response_text(fallback_text):
+                text = fallback_text
+                text_is_transient = False
 
         has_new_response = (
-            current_turn_has_text
+            current_turn_has_assistant
             or count > before_count
-            or (text and text != before_text)
+            or (text and not text_is_transient and text != before_text)
         )
         response_started = response_started or bool(has_new_response)
         now = time.monotonic()
@@ -753,12 +918,11 @@ async def wait_for_response(
                 elapsed_seconds * 1000,
                 json.dumps(snapshot, ensure_ascii=False),
             )
-        if response_started and text:
+        if response_started and text and not text_is_transient:
             if text != last_text:
                 last_text = text
                 last_change_at = now
 
-            assistant_done = bool(current_state.get("assistant_done"))
             if not current_turn_has_text:
                 assistant_done = await last_assistant_done_actions_visible(page)
             stop_button = await first_visible(page, STOP_BUTTON_SELECTORS)
@@ -770,7 +934,7 @@ async def wait_for_response(
                 assistant_done
                 or not stop_button
                 or send_button
-                or stable_seconds >= RESPONSE_FORCE_RETURN_STABLE_SECONDS
+                or stable_seconds >= response_force_return_stable_seconds()
             )
             trace_signature = (
                 response_started,
@@ -779,7 +943,12 @@ async def wait_for_response(
                 current_state.get("last_user_is_existing"),
                 user_matches,
                 bool(current_state.get("has_assistant_after_last_user")),
+                has_final_content,
                 len(text),
+                len(raw_text),
+                text_is_transient,
+                raw_text_is_transient,
+                raw_fallback_usable,
                 count,
                 assistant_done,
                 bool(stop_button),
@@ -798,9 +967,12 @@ async def wait_for_response(
                         "before_count=%s role_count=%s last_user_index=%s assistant_index=%s "
                         "started=%s current_turn=%s user_ready=%s user_existing=%s "
                         "user_matches=%s requires_marker=%s assistant_after_user=%s "
-                        "text_len=%s stable_seconds=%.1f assistant_done=%s "
+                        "has_final=%s text_len=%s raw_text_len=%s "
+                        "transient_text=%s transient_raw=%s raw_fallback=%s "
+                        "stable_seconds=%.1f assistant_done=%s "
                         "stop_visible=%s send_visible=%s looks_done=%s "
-                        "last_user_head=%r assistant_head=%r assistant_tail=%r"
+                        "last_user_head=%r assistant_final_head=%r assistant_final_tail=%r "
+                        "assistant_raw_head=%r"
                     ),
                     log_label,
                     conversation_key,
@@ -817,7 +989,12 @@ async def wait_for_response(
                     user_matches,
                     requires_user_match,
                     current_state.get("has_assistant_after_last_user"),
+                    has_final_content,
                     len(text),
+                    len(raw_text),
+                    text_is_transient,
+                    raw_text_is_transient,
+                    raw_fallback_usable,
                     stable_seconds,
                     assistant_done,
                     bool(stop_button),
@@ -826,6 +1003,7 @@ async def wait_for_response(
                     preview_for_log(user_text),
                     preview_for_log(text[:200]),
                     preview_for_log(text[-200:]),
+                    preview_for_log(raw_text[:200]),
                 )
             if response_is_stable and response_looks_done:
                 detailed_log(
@@ -851,7 +1029,9 @@ async def wait_for_response(
                     "before_count=%s role_count=%s last_user_index=%s assistant_index=%s "
                     "started=%s has_new_response=%s current_turn=%s user_ready=%s "
                     "user_existing=%s user_matches=%s requires_marker=%s assistant_after_user=%s "
-                    "text_len=%s last_user_head=%r assistant_head=%r"
+                    "has_final=%s text_len=%s raw_text_len=%s transient_text=%s "
+                    "transient_raw=%s raw_fallback=%s last_user_head=%r "
+                    "assistant_final_head=%r assistant_raw_head=%r"
                 ),
                 log_label,
                 conversation_key,
@@ -869,9 +1049,15 @@ async def wait_for_response(
                 user_matches,
                 requires_user_match,
                 current_state.get("has_assistant_after_last_user"),
+                has_final_content,
                 len(text),
+                len(raw_text),
+                text_is_transient,
+                raw_text_is_transient,
+                raw_fallback_usable,
                 preview_for_log(user_text),
                 preview_for_log(text[:200]),
+                preview_for_log(raw_text[:200]),
             )
 
         await page.wait_for_timeout(700)
@@ -907,6 +1093,7 @@ class ChatGPTWebBridge:
         reuse_cdp_page: bool = True,
         close_extra_chatgpt_pages: bool = False,
         chat_reset_seconds: int = 0,
+        retry_attempts: int = 1,
         headless: bool = False,
         timeout_ms: int = 180_000,
     ) -> None:
@@ -917,6 +1104,7 @@ class ChatGPTWebBridge:
         self.reuse_cdp_page = reuse_cdp_page
         self.close_extra_chatgpt_pages = close_extra_chatgpt_pages
         self.chat_reset_seconds = max(0, chat_reset_seconds)
+        self.retry_attempts = max(0, retry_attempts)
         self.headless = headless
         self.timeout_ms = timeout_ms
         self._context: BrowserContext | None = None
@@ -1012,9 +1200,28 @@ class ChatGPTWebBridge:
                     continue
                 raise ChatGPTBridgeError(f"浏览器自动化失败：{exc}") from exc
 
-    async def _get_page(self, conversation_key: str = "default") -> tuple[Page, bool]:
+    async def _get_page(
+        self,
+        conversation_key: str = "default",
+        force_new_page: bool = False,
+    ) -> tuple[Page, bool]:
         if not self._context:
             raise ChatGPTBridgeError("浏览器上下文尚未启动。")
+
+        if force_new_page:
+            current = self._pages.pop(conversation_key, None)
+            if conversation_key == "default":
+                self._page = None
+            self._chat_sessions.pop(conversation_key, None)
+            if current and not current.is_closed():
+                with contextlib.suppress(PlaywrightError):
+                    await current.close()
+
+            page = await self._context.new_page()
+            self._pages[conversation_key] = page
+            if conversation_key == "default":
+                self._page = page
+            return page, False
 
         if self.cdp_url and self.reuse_cdp_page:
             current = self._pages.get(conversation_key)
@@ -1059,6 +1266,57 @@ class ChatGPTWebBridge:
 
         page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         return page, False
+
+    async def close_conversation_page(
+        self,
+        conversation_key: str = "default",
+        log_label: str = "-",
+    ) -> None:
+        current = self._pages.pop(conversation_key, None)
+        if conversation_key == "default":
+            self._page = None
+        self._chat_sessions.pop(conversation_key, None)
+
+        closed = False
+        if current and not current.is_closed():
+            with contextlib.suppress(PlaywrightError):
+                await current.close()
+                closed = True
+
+        detailed_log(
+            "bridge.page.closed id=%s key=%s closed=%s",
+            log_label,
+            conversation_key,
+            closed,
+        )
+
+    async def _replace_page(
+        self,
+        conversation_key: str = "default",
+        log_label: str = "-",
+    ) -> None:
+        if not self._context:
+            raise ChatGPTBridgeError("浏览器上下文尚未启动。")
+
+        current = self._pages.pop(conversation_key, None)
+        if conversation_key == "default":
+            self._page = None
+        self._chat_sessions.pop(conversation_key, None)
+
+        if current and not current.is_closed():
+            with contextlib.suppress(PlaywrightError):
+                await current.close()
+
+        page = await self._context.new_page()
+        self._pages[conversation_key] = page
+        if conversation_key == "default":
+            self._page = page
+        detailed_log(
+            "bridge.page.replaced id=%s key=%s new_url=%r",
+            log_label,
+            conversation_key,
+            page.url,
+        )
 
     def _chat_expired(self, conversation_key: str) -> bool:
         session = self._chat_sessions.get(conversation_key)
@@ -1122,23 +1380,55 @@ class ChatGPTWebBridge:
         images: list[Path] | None = None,
         conversation_key: str = "default",
         force_new_chat: bool = False,
+        force_new_page: bool = False,
         log_label: str = "-",
     ) -> str:
-        for attempt in range(2):
+        last_error: BaseException | None = None
+        for attempt in range(self.retry_attempts + 1):
             try:
-                return await self._ask_once(
+                reply = await self._ask_once(
                     text=text,
                     images=images,
                     conversation_key=conversation_key,
-                    force_new_chat=force_new_chat,
+                    force_new_chat=force_new_chat or attempt > 0,
+                    force_new_page=force_new_page and attempt == 0,
                     log_label=log_label,
                 )
+                if not reply.strip():
+                    raise ChatGPTBridgeError("ChatGPT 返回为空。")
+                return reply
+            except ChatGPTBridgeError as exc:
+                last_error = exc
+                if attempt >= self.retry_attempts:
+                    raise
+                detailed_log(
+                    "bridge.ask.retry id=%s key=%s attempt=%s retry_attempts=%s error=%r",
+                    log_label,
+                    conversation_key,
+                    attempt + 1,
+                    self.retry_attempts,
+                    str(exc),
+                )
+                await self._replace_page(conversation_key=conversation_key, log_label=log_label)
             except PlaywrightError as exc:
-                if attempt == 0 and self._is_closed_browser_error(exc):
+                last_error = exc
+                if attempt >= self.retry_attempts:
+                    raise ChatGPTBridgeError(f"浏览器自动化失败：{exc}") from exc
+                detailed_log(
+                    "bridge.ask.retry id=%s key=%s attempt=%s retry_attempts=%s error=%r",
+                    log_label,
+                    conversation_key,
+                    attempt + 1,
+                    self.retry_attempts,
+                    str(exc),
+                )
+                if self._is_closed_browser_error(exc):
                     await self.reconnect()
-                    continue
-                raise ChatGPTBridgeError(f"浏览器自动化失败：{exc}") from exc
+                else:
+                    await self._replace_page(conversation_key=conversation_key, log_label=log_label)
 
+        if last_error:
+            raise ChatGPTBridgeError(f"浏览器自动化失败：{last_error}") from last_error
         raise ChatGPTBridgeError("浏览器自动化失败。")
 
     async def _ask_once(
@@ -1147,6 +1437,7 @@ class ChatGPTWebBridge:
         images: list[Path] | None = None,
         conversation_key: str = "default",
         force_new_chat: bool = False,
+        force_new_page: bool = False,
         log_label: str = "-",
     ) -> str:
         if not self._context:
@@ -1166,7 +1457,10 @@ class ChatGPTWebBridge:
             preview_for_log(text[:200]),
             preview_for_log(text[-200:]),
         )
-        page, should_close_page = await self._get_page(conversation_key=conversation_key)
+        page, should_close_page = await self._get_page(
+            conversation_key=conversation_key,
+            force_new_page=force_new_page,
+        )
         detailed_log(
             "bridge.page.selected id=%s key=%s should_close=%s url=%r",
             log_label,
@@ -1227,8 +1521,9 @@ class ChatGPTWebBridge:
                 (
                     "bridge.send.clicked id=%s key=%s url=%r role_count=%s "
                     "last_user_index=%s assistant_index=%s user_existing=%s "
-                    "user_matches=%s assistant_after_user=%s assistant_text_len=%s "
-                    "last_user_head=%r assistant_head=%r"
+                    "user_matches=%s assistant_after_user=%s has_final=%s "
+                    "assistant_final_len=%s assistant_raw_len=%s "
+                    "last_user_head=%r assistant_final_head=%r assistant_raw_head=%r"
                 ),
                 log_label,
                 conversation_key,
@@ -1239,9 +1534,12 @@ class ChatGPTWebBridge:
                 after_send_state.get("last_user_is_existing"),
                 request_text_matches_user(text, after_send_user_text),
                 after_send_state.get("has_assistant_after_last_user"),
+                after_send_state.get("has_final_content"),
                 len(str(after_send_state.get("text") or "")),
+                len(str(after_send_state.get("raw_text") or "")),
                 preview_for_log(after_send_user_text),
                 preview_for_log(str(after_send_state.get("text") or "")),
+                preview_for_log(str(after_send_state.get("raw_text") or "")),
             )
             detailed_log(
                 "bridge.dom.snapshot id=%s key=%s elapsed_ms=0.0 snapshot=%s",
@@ -1329,6 +1627,12 @@ def parse_args() -> argparse.Namespace:
         help="同一个 ChatGPT 对话复用多久后自动重开；0 表示不按时间自动重开。",
     )
     parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=1,
+        help="回复为空或网页自动化失败后，打开新标签页重试的次数；0 表示不重试。",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="无头模式。第一次登录或遇到验证时不要开启。",
@@ -1387,6 +1691,7 @@ async def async_main() -> int:
         reuse_cdp_page=not args.new_page_per_request,
         close_extra_chatgpt_pages=args.close_extra_chatgpt_pages,
         chat_reset_seconds=args.chat_reset_seconds,
+        retry_attempts=args.retry_attempts,
         headless=args.headless,
         timeout_ms=args.timeout * 1000,
     ) as bridge:
