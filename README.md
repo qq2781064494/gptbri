@@ -46,9 +46,10 @@ ChatGPT 网页
 
 ## 功能特性
 
-- OpenAI 兼容：支持 `/v1/chat/completions`、`/v1/models`、`Authorization: Bearer ...`
+- OpenAI 兼容：支持 `/v1/responses`、`/v1/chat/completions`、`/v1/models`、`Authorization: Bearer ...`
 - LangChain 兼容：支持 `ChatOpenAI(...)`、`invoke(...)`、`bind_tools(...)`
 - Tool Calling：让模型返回工具调用 JSON，本地执行 Python 工具，再把工具结果交回模型生成最终回答
+- Agent 调试友好：所有请求都经过可见的 ChatGPT 页面，能直接看到 agent 每轮循环的输入、工具结果和最终输出
 - 图片输入：支持本地图片路径、`file://`、HTTP 图片 URL、base64 data URL
 - 会话管理：普通聊天和工具调用分别使用固定 ChatGPT 标签页，避免每次请求新开页面
 - 自动重开：可配置一个聊天框使用多久后重开，减少上下文污染
@@ -251,6 +252,8 @@ ChatGPT 根据工具结果生成最终回答
 
 重点：工具函数始终在你本地 Python 里执行。ChatGPT 不会真的执行你的函数，它只负责判断是否需要调用工具、调用哪个工具、传什么参数，以及最后把工具结果组织成自然语言回答。
 
+工具规划遵循证据原则：如果当前用户问题没有给足回答所需事实，但可用工具能获取或验证这些事实，就应该先调用工具，而不是让用户再提供本地工具已经能读取的信息。
+
 如果 ChatGPT 偶发没有输出合法 JSON，可以临时打开本地规则兜底：
 
 ```env
@@ -369,6 +372,7 @@ BRIDGE_PORT=8020
 ```text
 GET  /health
 GET  /v1/models
+POST /v1/responses
 POST /v1/chat/completions
 ```
 
@@ -376,10 +380,37 @@ POST /v1/chat/completions
 
 ```text
 GET  /models
+POST /responses
 POST /chat/completions
 ```
 
 `stream=true` 可以请求，但底层网页无法做到真正 token 级流式输出。服务会等待完整回复生成后，再用 SSE 格式一次性返回，主要用于兼容已有客户端。
+
+### Codex++ / Codex 接入
+
+在 Codex++ 供应商配置里可以使用：
+
+```text
+Base URL: http://127.0.0.1:8011/v1
+Model: chatgpt-web
+上游协议: Responses API 或 Chat Completions
+```
+
+如果使用旧版本服务，必须选择 `Chat Completions`。当前版本已经补了 `/v1/responses` 兼容入口，可以直接使用截图里的 `Responses API`。
+
+接 Codex 时默认复用固定 ChatGPT 对话槽，并给每次请求加独立边界，避免 ChatGPT 网页历史把旧项目上下文、工具规划 JSON 带入下一次请求。一般不建议长期打开每次新建对话，否则容易触发账号侧频率限制。
+
+```env
+BRIDGE_ISOLATE_REUSED_CHAT=1
+```
+
+只有在调试严重上下文污染时，才临时启用：
+
+```env
+BRIDGE_FORCE_NEW_CHAT_PER_REQUEST=1
+BRIDGE_FORCE_NEW_TOOL_CHAT=1
+BRIDGE_FORCE_NEW_CODEX_CHAT=1
+```
 
 ## 单脚本模式
 
@@ -450,7 +481,7 @@ bash launch_chrome_debug.sh
 bash launch_chrome_debug.sh
 ```
 
-然后在打开的真实 Chrome 里手动登录 ChatGPT。登录成功、能看到输入框后，再启动 API 服务。
+然后在打开的真实 Chrome 里手动登录 ChatGPT。使用 Google 账号登录时，优先尝试手机扫码确认，通常比让自动化浏览器直接输入账号密码更容易通过安全检测。登录成功、能看到输入框后，再启动 API 服务。
 
 ### API 打开了很多 ChatGPT 页面
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 import time
@@ -407,12 +408,19 @@ class ChatGPTWebBridge:
             )
 
         self._playwright = await async_playwright().start()
+        await self._open_context()
+        return self
+
+    async def _open_context(self) -> None:
+        if not self._playwright:
+            raise ChatGPTBridgeError("Playwright 尚未启动。")
+
         if self.cdp_url:
             self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
             if not self._browser.contexts:
                 raise ChatGPTBridgeError("已连接 Chrome，但没有可用浏览器上下文。")
             self._context = self._browser.contexts[0]
-            return self
+            return
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         launch_options = {
@@ -428,18 +436,54 @@ class ChatGPTWebBridge:
         self._context = await self._playwright.chromium.launch_persistent_context(
             **launch_options
         )
-        return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._context and not self.cdp_url:
-            await self._context.close()
+        await self._close_context()
         if self._playwright:
             await self._playwright.stop()
+        self._playwright = None
+
+    async def _close_context(self) -> None:
+        if self._context and not self.cdp_url:
+            with contextlib.suppress(PlaywrightError):
+                await self._context.close()
+
+        self._context = None
+        self._browser = None
+        self._page = None
+        self._pages.clear()
+        self._closed_extra_pages = False
+
+    async def reconnect(self) -> None:
+        """Reconnect to Chrome after the CDP/browser context has gone away."""
+        await self._close_context()
+        try:
+            await self._open_context()
+        except PlaywrightError as exc:
+            raise ChatGPTBridgeError(f"重新连接 Chrome 远程调试端口失败：{exc}") from exc
+
+    @staticmethod
+    def _is_closed_browser_error(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return (
+            "target page, context or browser has been closed" in message
+            or "browsercontext.new_page" in message and "closed" in message
+            or "page.goto" in message and "closed" in message
+            or "browser has been closed" in message
+        )
 
     async def ensure_conversation_pages(self, conversation_keys: list[str]) -> None:
-        for conversation_key in conversation_keys:
-            page, _ = await self._get_page(conversation_key=conversation_key)
-            await self._ensure_active_chat(page, conversation_key=conversation_key)
+        for attempt in range(2):
+            try:
+                for conversation_key in conversation_keys:
+                    page, _ = await self._get_page(conversation_key=conversation_key)
+                    await self._ensure_active_chat(page, conversation_key=conversation_key)
+                return
+            except PlaywrightError as exc:
+                if attempt == 0 and self._is_closed_browser_error(exc):
+                    await self.reconnect()
+                    continue
+                raise ChatGPTBridgeError(f"浏览器自动化失败：{exc}") from exc
 
     async def _get_page(self, conversation_key: str = "default") -> tuple[Page, bool]:
         if not self._context:
@@ -518,6 +562,29 @@ class ChatGPTWebBridge:
             session["started_at"] = time.monotonic()
 
     async def ask(
+        self,
+        text: str,
+        images: list[Path] | None = None,
+        conversation_key: str = "default",
+        force_new_chat: bool = False,
+    ) -> str:
+        for attempt in range(2):
+            try:
+                return await self._ask_once(
+                    text=text,
+                    images=images,
+                    conversation_key=conversation_key,
+                    force_new_chat=force_new_chat,
+                )
+            except PlaywrightError as exc:
+                if attempt == 0 and self._is_closed_browser_error(exc):
+                    await self.reconnect()
+                    continue
+                raise ChatGPTBridgeError(f"浏览器自动化失败：{exc}") from exc
+
+        raise ChatGPTBridgeError("浏览器自动化失败。")
+
+    async def _ask_once(
         self,
         text: str,
         images: list[Path] | None = None,
