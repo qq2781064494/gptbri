@@ -6,8 +6,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
 import contextlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -38,6 +40,9 @@ DEFAULT_API_CHAT_URL = "https://chatgpt.com/"
 DEFAULT_MODEL_NAME = "chatgpt-web"
 DEFAULT_CHAT_CONVERSATION_KEY = "chat"
 DEFAULT_TOOL_CONVERSATION_KEY = "tool"
+LOG_PREVIEW_CHARS = 10
+LOG_PREVIEW_BYTES = 8192
+LOG_PREVIEW_CAPTURE_BYTES = 256 * 1024
 
 
 def env_str(name: str, default: str | None = None) -> str | None:
@@ -61,6 +66,38 @@ def env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def setup_logging() -> logging.Logger:
+    level_name = (env_str("BRIDGE_LOG_LEVEL", "INFO") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger = logging.getLogger("chatgpt_bridge_api")
+    logger.setLevel(level)
+    return logger
+
+
+logger = setup_logging()
+CURRENT_REQUEST_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "chatgpt_bridge_request_id",
+    default="-",
+)
+
+
+def current_request_id() -> str:
+    return CURRENT_REQUEST_ID.get("-")
+
+
+def detailed_logs_enabled() -> bool:
+    return env_bool("BRIDGE_DETAILED_LOGS", False)
+
+
+def detailed_log(message: str, *args: Any) -> None:
+    if detailed_logs_enabled():
+        logger.info(message, *args)
+
+
 def model_name() -> str:
     return env_str("BRIDGE_MODEL_NAME", DEFAULT_MODEL_NAME) or DEFAULT_MODEL_NAME
 
@@ -68,10 +105,414 @@ def model_name() -> str:
 class Runtime:
     def __init__(self) -> None:
         self.bridge: ChatGPTWebBridge | None = None
-        self.lock = asyncio.Lock()
+        self.locks: dict[str, asyncio.Lock] = {}
+
+    def lock_for(self, conversation_key: str) -> asyncio.Lock:
+        key = conversation_key or "default"
+        lock = self.locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.locks[key] = lock
+        return lock
 
 
 runtime = Runtime()
+
+
+class RequestTimingLogMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = request_id_from_scope(scope) or uuid.uuid4().hex[:12]
+        method = str(scope.get("method") or "")
+        path = str(scope.get("path") or "")
+        client = scope.get("client")
+        client_addr = client_address(scope)
+        started_at = time.time()
+        status_code: int | None = None
+        returned = False
+        request_messages = await read_request_messages(receive)
+        request_preview = body_preview_from_messages(request_messages)
+        response_preview = BodyPreviewCapture()
+        receive_replay = replay_request_messages(request_messages)
+        request_id_token = CURRENT_REQUEST_ID.set(request_id)
+
+        logger.info(
+            (
+                "request.received id=%s method=%s path=%s client=%s "
+                "request_bytes=%s request_text_head=%r request_text_tail=%r"
+            ),
+            request_id,
+            method,
+            path,
+            client_addr,
+            request_preview["bytes"],
+            request_preview["head"],
+            request_preview["tail"],
+        )
+
+        async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal status_code, returned
+            if message.get("type") == "http.response.start":
+                status_code = int(message.get("status") or 0)
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-request-id", request_id.encode("latin-1", "ignore")))
+                message = {**message, "headers": headers}
+            elif (
+                message.get("type") == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                response_preview.add(message.get("body") or b"")
+                returned = True
+                log_request_returned(
+                    request_id,
+                    method,
+                    path,
+                    status_code,
+                    started_at,
+                    request_preview,
+                    response_preview.preview(),
+                )
+            elif message.get("type") == "http.response.body":
+                response_preview.add(message.get("body") or b"")
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive_replay, send_wrapper)
+        except Exception:
+            duration_ms = (time.time() - started_at) * 1000
+            response = response_preview.preview()
+            logger.exception(
+                (
+                    "request.failed id=%s method=%s path=%s status=%s duration_ms=%.1f "
+                    "request_bytes=%s request_text_head=%r request_text_tail=%r "
+                    "response_bytes=%s response_text_head=%r response_text_tail=%r"
+                ),
+                request_id,
+                method,
+                path,
+                status_code or "-",
+                duration_ms,
+                request_preview["bytes"],
+                request_preview["head"],
+                request_preview["tail"],
+                response["bytes"],
+                response["head"],
+                response["tail"],
+            )
+            raise
+        finally:
+            if not returned and status_code is not None:
+                log_request_returned(
+                    request_id,
+                    method,
+                    path,
+                    status_code,
+                    started_at,
+                    request_preview,
+                    response_preview.preview(),
+                )
+            CURRENT_REQUEST_ID.reset(request_id_token)
+
+
+class BodyPreviewCapture:
+    def __init__(self) -> None:
+        self.total_bytes = 0
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.sample = bytearray()
+
+    def add(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+
+        self.total_bytes += len(chunk)
+        if len(self.sample) < LOG_PREVIEW_CAPTURE_BYTES:
+            needed = LOG_PREVIEW_CAPTURE_BYTES - len(self.sample)
+            self.sample.extend(chunk[:needed])
+
+        if len(self.head) < LOG_PREVIEW_BYTES:
+            needed = LOG_PREVIEW_BYTES - len(self.head)
+            self.head.extend(chunk[:needed])
+
+        self.tail.extend(chunk)
+        if len(self.tail) > LOG_PREVIEW_BYTES:
+            del self.tail[: len(self.tail) - LOG_PREVIEW_BYTES]
+
+    def preview(self) -> dict[str, Any]:
+        semantic_text = extract_log_semantic_text(bytes(self.sample))
+        if semantic_text:
+            return text_preview(semantic_text, self.total_bytes)
+        return body_preview_from_parts(bytes(self.head), bytes(self.tail), self.total_bytes)
+
+
+async def read_request_messages(receive: Any) -> list[dict[str, Any]]:
+    messages = []
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message.get("type") != "http.request":
+            break
+        if not message.get("more_body", False):
+            break
+    return messages
+
+
+def replay_request_messages(messages: list[dict[str, Any]]) -> Any:
+    index = 0
+    wait_forever = asyncio.Event()
+
+    async def receive() -> dict[str, Any]:
+        nonlocal index
+        if index < len(messages):
+            message = messages[index]
+            index += 1
+            return message
+
+        # StreamingResponse keeps a background disconnect listener that awaits
+        # receive(). Returning empty http.request messages forever creates a
+        # tight loop and prevents the stream task from sending chunks.
+        await wait_forever.wait()
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+def body_preview_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    chunks = [
+        message.get("body") or b""
+        for message in messages
+        if message.get("type") == "http.request"
+    ]
+    body = b"".join(chunk for chunk in chunks if isinstance(chunk, bytes))
+    return body_preview_from_bytes(body)
+
+
+def body_preview_from_bytes(body: bytes, total_bytes: int | None = None) -> dict[str, Any]:
+    byte_count = len(body) if total_bytes is None else total_bytes
+    semantic_text = extract_log_semantic_text(body)
+    if semantic_text:
+        return text_preview(semantic_text, byte_count)
+
+    return body_preview_from_parts(body[:LOG_PREVIEW_BYTES], body[-LOG_PREVIEW_BYTES:], byte_count)
+
+
+def text_preview(text: str, total_bytes: int) -> dict[str, Any]:
+    normalized = normalize_log_text(text)
+    return {
+        "bytes": total_bytes,
+        "head": normalized[:LOG_PREVIEW_CHARS],
+        "tail": normalized[-LOG_PREVIEW_CHARS:],
+    }
+
+
+def body_preview_from_parts(
+    head_bytes: bytes,
+    tail_bytes: bytes,
+    total_bytes: int,
+) -> dict[str, Any]:
+    head_text = decode_log_preview(head_bytes)
+    tail_text = decode_log_preview(tail_bytes)
+    return {
+        "bytes": total_bytes,
+        "head": head_text[:LOG_PREVIEW_CHARS] if head_text else "",
+        "tail": tail_text[-LOG_PREVIEW_CHARS:] if tail_text else "",
+    }
+
+
+def extract_log_semantic_text(body: bytes) -> str:
+    if not body:
+        return ""
+
+    text = body.decode("utf-8", errors="replace")
+    payload = parse_log_json(text)
+    if payload is not None:
+        return extract_json_payload_text(payload)
+
+    if "data:" in text:
+        return extract_sse_payload_text(text)
+
+    return ""
+
+
+def parse_log_json(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_sse_payload_text(text: str) -> str:
+    parts = []
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        payload = parse_log_json(data)
+        if payload is None:
+            parts.append(data)
+        else:
+            extracted = extract_json_payload_text(payload)
+            if extracted:
+                parts.append(extracted)
+    return "\n".join(parts)
+
+
+def extract_json_payload_text(payload: Any) -> str:
+    parts: list[str] = []
+    if isinstance(payload, dict):
+        instructions = payload.get("instructions")
+        if isinstance(instructions, str):
+            parts.append(instructions)
+
+        for key in ("messages", "input", "output"):
+            if key in payload:
+                parts.extend(extract_payload_text_parts(payload[key]))
+
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                parts.extend(extract_payload_text_parts(choice.get("message")))
+                parts.extend(extract_payload_text_parts(choice.get("delta")))
+
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str):
+            parts.append(output_text)
+
+        if not parts:
+            parts.extend(extract_payload_text_parts(payload))
+    else:
+        parts.extend(extract_payload_text_parts(payload))
+
+    return "\n".join(part for part in parts if part)
+
+
+def extract_payload_text_parts(value: Any) -> list[str]:
+    parts: list[str] = []
+    if value is None:
+        return parts
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+        return parts
+    if isinstance(value, (int, float, bool)):
+        parts.append(str(value))
+        return parts
+    if isinstance(value, list):
+        for item in value:
+            parts.extend(extract_payload_text_parts(item))
+        return parts
+    if not isinstance(value, dict):
+        return parts
+
+    value_type = str(value.get("type") or "")
+    role = str(value.get("role") or "")
+    if isinstance(value.get("content"), str):
+        parts.append(with_log_role(role, value["content"]))
+    else:
+        parts.extend(extract_payload_text_parts(value.get("content")))
+
+    for key in ("text", "output_text"):
+        item = value.get(key)
+        if isinstance(item, str):
+            parts.append(with_log_role(role, item))
+
+    image_url = value.get("image_url") or value.get("input_image")
+    if image_url:
+        parts.append("[image]")
+
+    function = value.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        arguments = function.get("arguments")
+        if name or arguments:
+            parts.append(f"{name or 'function'}({arguments or ''})")
+
+    if value_type in {"function_call", "tool_call"}:
+        name = value.get("name") or value.get("call_id") or value_type
+        arguments = value.get("arguments") or value.get("input") or ""
+        parts.append(f"{name}({arguments})")
+
+    for key in ("message", "delta", "output", "input"):
+        if key in value:
+            parts.extend(extract_payload_text_parts(value[key]))
+
+    return parts
+
+
+def with_log_role(role: str, text: str) -> str:
+    return text
+
+
+def normalize_log_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def decode_log_preview(data: bytes) -> str:
+    if not data:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    return normalize_log_text(text)
+
+
+def request_id_from_scope(scope: dict[str, Any]) -> str | None:
+    for name, value in scope.get("headers") or []:
+        if name.lower() == b"x-request-id":
+            decoded = value.decode("latin-1").strip()
+            return decoded or None
+    return None
+
+
+def client_address(scope: dict[str, Any]) -> str:
+    client = scope.get("client")
+    if isinstance(client, tuple) and len(client) >= 2:
+        return f"{client[0]}:{client[1]}"
+    if isinstance(client, tuple) and client:
+        return str(client[0])
+    return "-"
+
+
+def log_request_returned(
+    request_id: str,
+    method: str,
+    path: str,
+    status_code: int | None,
+    started_at: float,
+    request_preview: dict[str, Any],
+    response_preview: dict[str, Any],
+) -> None:
+    duration_ms = (time.time() - started_at) * 1000
+    logger.info(
+        (
+            "request.returned id=%s method=%s path=%s status=%s duration_ms=%.1f "
+            "request_bytes=%s request_text_head=%r request_text_tail=%r "
+            "response_bytes=%s response_text_head=%r response_text_tail=%r"
+        ),
+        request_id,
+        method,
+        path,
+        status_code or "-",
+        duration_ms,
+        request_preview["bytes"],
+        request_preview["head"],
+        request_preview["tail"],
+        response_preview["bytes"],
+        response_preview["head"],
+        response_preview["tail"],
+    )
 
 
 @contextlib.asynccontextmanager
@@ -106,6 +547,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="ChatGPT Web Bridge API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(RequestTimingLogMiddleware)
 
 
 @app.exception_handler(HTTPException)
@@ -227,19 +669,54 @@ async def create_chat_completion(payload: dict[str, Any]) -> JSONResponse | Stre
     if not isinstance(messages, list) or not messages:
         raise openai_error(422, "messages must be a non-empty array.")
 
+    detailed_log(
+        "chat.route.start id=%s model=%s stream=%s message_count=%s",
+        current_request_id(),
+        request_model,
+        payload.get("stream") is True,
+        len(messages),
+    )
     result = await complete_chat_request(payload, messages, request_model)
+    detailed_log(
+        "chat.route.result id=%s kind=%s prompt_chars=%s",
+        current_request_id(),
+        result.get("kind"),
+        len(str(result.get("prompt") or "")),
+    )
     if result["kind"] == "tool_calls":
-        return JSONResponse(tool_call_response(result["tool_calls"], request_model, result["prompt"]))
+        response_payload = tool_call_response(
+            result["tool_calls"],
+            request_model,
+            result["prompt"],
+        )
+        detailed_log(
+            "chat.route.return_json id=%s kind=tool_calls response_bytes=%s",
+            current_request_id(),
+            len(json.dumps(response_payload, ensure_ascii=False).encode("utf-8")),
+        )
+        return JSONResponse(response_payload)
 
     reply = str(result["reply"])
     if payload.get("stream") is True:
+        detailed_log(
+            "chat.route.return_stream id=%s reply_chars=%s",
+            current_request_id(),
+            len(reply),
+        )
         return StreamingResponse(
             stream_response(reply, request_model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return JSONResponse(chat_completion_response(reply, request_model, result["prompt"]))
+    response_payload = chat_completion_response(reply, request_model, result["prompt"])
+    detailed_log(
+        "chat.route.return_json id=%s kind=message reply_chars=%s response_bytes=%s",
+        current_request_id(),
+        len(reply),
+        len(json.dumps(response_payload, ensure_ascii=False).encode("utf-8")),
+    )
+    return JSONResponse(response_payload)
 
 
 @app.post("/responses", dependencies=[Depends(require_api_key)], response_model=None)
@@ -275,9 +752,29 @@ async def complete_chat_request(
     has_tools_result = has_tool_result(messages)
     conversation_key = request_conversation_key(tools, has_tools_result)
     force_new_chat = should_force_new_chat(messages, tools, has_tools_result)
+    detailed_log(
+        (
+            "chat.complete.start id=%s model=%s key=%s tools=%s has_tools_result=%s "
+            "tool_choice=%r force_new=%s"
+        ),
+        current_request_id(),
+        request_model,
+        conversation_key,
+        len(tools),
+        has_tools_result,
+        tool_choice,
+        force_new_chat,
+    )
     if tools and tool_choice != "none" and not has_tools_result:
         with tempfile.TemporaryDirectory(prefix="chatgpt_bridge_api_") as tmp_dir:
             prompt, images = await build_prompt_and_images(messages, Path(tmp_dir))
+            detailed_log(
+                "chat.complete.plan_prompt id=%s key=%s prompt_chars=%s images=%s",
+                current_request_id(),
+                conversation_key,
+                len(prompt),
+                len(images),
+            )
             tool_calls, final_answer = await choose_tool_response(
                 messages,
                 tools,
@@ -294,6 +791,12 @@ async def complete_chat_request(
                 "prompt": prompt,
             }
         if final_answer:
+            detailed_log(
+                "chat.complete.plan_final_answer id=%s key=%s reply_chars=%s",
+                current_request_id(),
+                conversation_key,
+                len(final_answer),
+            )
             return {
                 "kind": "message",
                 "reply": final_answer,
@@ -305,21 +808,50 @@ async def complete_chat_request(
             prompt, images = await build_final_tool_answer_prompt(messages, Path(tmp_dir))
         else:
             prompt, images = await build_prompt_and_images(messages, Path(tmp_dir))
+        detailed_log(
+            "chat.complete.prompt_ready id=%s key=%s prompt_chars=%s images=%s",
+            current_request_id(),
+            conversation_key,
+            len(prompt),
+            len(images),
+        )
 
-        async with runtime.lock:
+        async with runtime.lock_for(conversation_key):
             try:
+                detailed_log(
+                    "chat.complete.bridge_call id=%s key=%s prompt_chars=%s images=%s",
+                    current_request_id(),
+                    conversation_key,
+                    len(prompt),
+                    len(images),
+                )
                 reply = await runtime.bridge.ask(
                     text=isolate_reused_chat_prompt(prompt),
                     images=images,
                     conversation_key=conversation_key,
                     force_new_chat=force_new_chat,
+                    log_label=current_request_id(),
+                )
+                detailed_log(
+                    "chat.complete.bridge_returned id=%s key=%s reply_chars=%s",
+                    current_request_id(),
+                    conversation_key,
+                    len(reply),
                 )
             except ChatGPTBridgeError as exc:
                 raise openai_error(502, str(exc)) from exc
 
+    unwrapped_reply = unwrap_planner_final_answer(reply)
+    detailed_log(
+        "chat.complete.return_message id=%s key=%s reply_chars=%s unwrapped_chars=%s",
+        current_request_id(),
+        conversation_key,
+        len(reply),
+        len(unwrapped_reply),
+    )
     return {
         "kind": "message",
-        "reply": unwrap_planner_final_answer(reply),
+        "reply": unwrapped_reply,
         "prompt": prompt,
     }
 
@@ -844,13 +1376,14 @@ async def plan_tool_calls_with_web(
         f"完整请求消息上下文：\n{full_request}"
     )
 
-    async with runtime.lock:
+    async with runtime.lock_for(conversation_key):
         try:
             reply = await runtime.bridge.ask(
                 text=isolate_reused_chat_prompt(planner_prompt),
                 images=request_images or [],
                 conversation_key=conversation_key,
                 force_new_chat=force_new_chat,
+                log_label=current_request_id(),
             )
         except ChatGPTBridgeError:
             return [], None

@@ -12,10 +12,12 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     from playwright.async_api import (
@@ -43,6 +45,23 @@ else:
 
 DEFAULT_CHAT_URL = "https://chatgpt.com/c/6a4cc5f7-c524-83ee-a764-a38507e616fd"
 DEFAULT_PROFILE_DIR = ".chatgpt_playwright_profile"
+logger = logging.getLogger("chatgpt_bridge")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def detailed_logs_enabled() -> bool:
+    return env_bool("BRIDGE_DETAILED_LOGS", False)
+
+
+def detailed_log(message: str, *args: Any) -> None:
+    if detailed_logs_enabled():
+        logger.info(message, *args)
 
 COMPOSER_SELECTORS = [
     'div[contenteditable="true"][role="textbox"]',
@@ -69,6 +88,26 @@ STOP_BUTTON_SELECTORS = [
     'button[aria-label*="Stop"]',
     'button[aria-label*="停止"]',
 ]
+
+ASSISTANT_DONE_SELECTORS = [
+    'button[data-testid="copy-turn-action-button"]',
+    'button[data-testid="good-response-turn-action-button"]',
+    'button[data-testid="bad-response-turn-action-button"]',
+    'button[aria-label*="Good response"]',
+    'button[aria-label*="Bad response"]',
+    'button[aria-label*="Read aloud"]',
+    'button[aria-label*="朗读"]',
+    'button[aria-label*="Regenerate"]',
+    'button[aria-label*="重新生成"]',
+    'button[aria-label*="More"]',
+    'button[aria-label*="更多"]',
+]
+
+RESPONSE_STABLE_SECONDS = 2.0
+RESPONSE_FORCE_RETURN_STABLE_SECONDS = 5.0
+RESPONSE_TRACE_LOG_INTERVAL_SECONDS = 2.0
+LOG_TEXT_PREVIEW_CHARS = 120
+EXISTING_USER_MARK_ATTR = "data-chatgpt-bridge-existing-user"
 
 ASSISTANT_MESSAGE_SELECTORS = [
     '[data-message-author-role="assistant"]',
@@ -302,8 +341,7 @@ async def assistant_message_count(page: Page) -> int:
     return 0
 
 
-async def last_assistant_text(page: Page) -> str:
-    """Extract text from the latest assistant message."""
+async def last_assistant_message(page: Page) -> Locator | None:
     for selector in ASSISTANT_MESSAGE_SELECTORS:
         locator = page.locator(selector)
         try:
@@ -311,20 +349,319 @@ async def last_assistant_text(page: Page) -> str:
             if not count:
                 continue
 
-            message = locator.nth(count - 1)
-            markdown = message.locator(".markdown").last
-            if await markdown.count():
-                text = await markdown.inner_text(timeout=1000)
-            else:
-                text = await message.inner_text(timeout=1000)
-
-            text = cleanup_chatgpt_text(text)
-            if text:
-                return text
+            return locator.nth(count - 1)
         except PlaywrightError:
             continue
 
+    return None
+
+
+async def last_assistant_text(page: Page) -> str:
+    """Extract text from the latest assistant message."""
+    message = await last_assistant_message(page)
+    if not message:
+        return ""
+
+    try:
+        markdown = message.locator(".markdown").last
+        if await markdown.count():
+            text = await markdown.inner_text(timeout=1000)
+        else:
+            text = await message.inner_text(timeout=1000)
+
+        text = cleanup_chatgpt_text(text)
+        if text:
+            return text
+    except PlaywrightError:
+        pass
+
     return ""
+
+
+async def last_assistant_turn(page: Page) -> Locator | None:
+    message = await last_assistant_message(page)
+    if not message:
+        return None
+
+    ancestor_selectors = [
+        'xpath=ancestor::*[contains(@data-testid, "conversation-turn")][1]',
+        "xpath=ancestor::article[1]",
+    ]
+    for selector in ancestor_selectors:
+        try:
+            ancestor = message.locator(selector)
+            if await ancestor.count():
+                return ancestor.first
+        except PlaywrightError:
+            continue
+
+    return message
+
+
+async def last_assistant_done_actions_visible(page: Page) -> bool:
+    turn = await last_assistant_turn(page)
+    if not turn:
+        return False
+
+    for selector in ASSISTANT_DONE_SELECTORS:
+        try:
+            locator = turn.locator(selector)
+            count = await locator.count()
+            for index in range(count - 1, -1, -1):
+                if await is_usable_visible(locator.nth(index)):
+                    return True
+        except PlaywrightError:
+            continue
+
+    return False
+
+
+async def mark_existing_user_messages(page: Page) -> int:
+    """Mark all user messages already on the page before sending a new prompt."""
+    try:
+        return int(await page.evaluate(
+            """attr => {
+                const nodes = Array.from(
+                    document.querySelectorAll('[data-message-author-role="user"]')
+                );
+                nodes.forEach(el => el.setAttribute(attr, "1"));
+                return nodes.length;
+            }""",
+            EXISTING_USER_MARK_ATTR,
+        ))
+    except PlaywrightError:
+        return 0
+
+
+async def current_turn_response_state(page: Page) -> dict[str, Any]:
+    """Return the assistant state belonging to the latest unmarked user turn."""
+    empty = {
+        "text": "",
+        "last_user_text": "",
+        "last_user_is_existing": True,
+        "has_assistant_after_last_user": False,
+        "assistant_done": False,
+        "role_count": 0,
+        "last_user_index": -1,
+        "assistant_index": -1,
+    }
+
+    try:
+        state = await page.evaluate(
+            """({doneSelectors, existingUserAttr}) => {
+                const textOf = el => {
+                    if (!el) return "";
+                    const markdown = el.querySelector(".markdown");
+                    const target = markdown || el;
+                    return target.innerText || target.textContent || "";
+                };
+                const isVisible = el => {
+                    if (!el || el.hidden || el.getAttribute("aria-hidden") === "true") {
+                        return false;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden"
+                        && style.pointerEvents !== "none";
+                };
+                const turnOf = el => {
+                    let current = el;
+                    for (let depth = 0; current && depth < 10; depth += 1) {
+                        const testId = current.getAttribute("data-testid") || "";
+                        if (testId.includes("conversation-turn")
+                            || current.tagName.toLowerCase() === "article") {
+                            return current;
+                        }
+                        current = current.parentElement;
+                    }
+                    return el;
+                };
+
+                const roleNodes = Array.from(
+                    document.querySelectorAll("[data-message-author-role]")
+                ).filter(el => {
+                    const role = el.getAttribute("data-message-author-role");
+                    return role === "user" || role === "assistant";
+                });
+
+                let lastUserIndex = -1;
+                for (let index = roleNodes.length - 1; index >= 0; index -= 1) {
+                    if (roleNodes[index].getAttribute("data-message-author-role") === "user") {
+                        lastUserIndex = index;
+                        break;
+                    }
+                }
+
+                const lastUser = lastUserIndex >= 0 ? roleNodes[lastUserIndex] : null;
+                let assistant = null;
+                let assistantIndex = -1;
+                for (let index = lastUserIndex + 1; index < roleNodes.length; index += 1) {
+                    if (roleNodes[index].getAttribute("data-message-author-role") !== "assistant") {
+                        continue;
+                    }
+                    assistant = roleNodes[index];
+                    assistantIndex = index;
+                    if (textOf(assistant).trim()) {
+                        break;
+                    }
+                }
+
+                const turn = assistant ? turnOf(assistant) : null;
+                const assistantDone = !!turn && doneSelectors.some(selector => {
+                    try {
+                        return Array.from(turn.querySelectorAll(selector)).some(isVisible);
+                    } catch {
+                        return false;
+                    }
+                });
+
+                return {
+                    text: textOf(assistant),
+                    last_user_text: textOf(lastUser),
+                    last_user_is_existing: !lastUser
+                        || lastUser.getAttribute(existingUserAttr) === "1",
+                    has_assistant_after_last_user: !!assistant
+                        && lastUserIndex >= 0
+                        && assistantIndex > lastUserIndex,
+                    assistant_done: assistantDone,
+                    role_count: roleNodes.length,
+                    last_user_index: lastUserIndex,
+                    assistant_index: assistantIndex,
+                };
+            }""",
+            {
+                "doneSelectors": ASSISTANT_DONE_SELECTORS,
+                "existingUserAttr": EXISTING_USER_MARK_ATTR,
+            },
+        )
+    except PlaywrightError:
+        return empty
+
+    if not isinstance(state, dict):
+        return empty
+
+    return {
+        "text": cleanup_chatgpt_text(str(state.get("text") or "")),
+        "last_user_text": cleanup_chatgpt_text(str(state.get("last_user_text") or "")),
+        "last_user_is_existing": bool(state.get("last_user_is_existing", True)),
+        "has_assistant_after_last_user": bool(state.get("has_assistant_after_last_user")),
+        "assistant_done": bool(state.get("assistant_done")),
+        "role_count": int(state.get("role_count") or 0),
+        "last_user_index": int(state.get("last_user_index") or -1),
+        "assistant_index": int(state.get("assistant_index") or -1),
+    }
+
+
+async def chat_dom_snapshot(page: Page, limit: int = 8) -> dict[str, Any]:
+    """Return a compact snapshot of the latest ChatGPT role nodes."""
+    try:
+        snapshot = await page.evaluate(
+            """({existingUserAttr, limit}) => {
+                const textOf = el => {
+                    if (!el) return "";
+                    const markdown = el.querySelector(".markdown");
+                    const target = markdown || el;
+                    return (target.innerText || target.textContent || "").replace(/\\s+/g, " ").trim();
+                };
+                const turnOf = el => {
+                    let current = el;
+                    for (let depth = 0; current && depth < 10; depth += 1) {
+                        const testId = current.getAttribute("data-testid") || "";
+                        if (testId.includes("conversation-turn")
+                            || current.tagName.toLowerCase() === "article") {
+                            return current;
+                        }
+                        current = current.parentElement;
+                    }
+                    return el;
+                };
+                const roleNodes = Array.from(
+                    document.querySelectorAll("[data-message-author-role]")
+                ).filter(el => {
+                    const role = el.getAttribute("data-message-author-role");
+                    return role === "user" || role === "assistant";
+                });
+                const start = Math.max(0, roleNodes.length - limit);
+                const nodes = roleNodes.slice(start).map((el, offset) => {
+                    const rect = el.getBoundingClientRect();
+                    const turn = turnOf(el);
+                    const text = textOf(el);
+                    return {
+                        index: start + offset,
+                        role: el.getAttribute("data-message-author-role") || "",
+                        existing_user: el.getAttribute(existingUserAttr) === "1",
+                        text_len: text.length,
+                        text_head: text.slice(0, 80),
+                        text_tail: text.slice(Math.max(0, text.length - 80)),
+                        visible: rect.width > 0 && rect.height > 0,
+                        tag: el.tagName.toLowerCase(),
+                        testid: el.getAttribute("data-testid") || "",
+                        turn_testid: turn ? (turn.getAttribute("data-testid") || "") : "",
+                    };
+                });
+                return {
+                    url: location.href,
+                    title: document.title,
+                    role_count: roleNodes.length,
+                    nodes,
+                };
+            }""",
+            {"existingUserAttr": EXISTING_USER_MARK_ATTR, "limit": limit},
+        )
+    except PlaywrightError as exc:
+        return {"error": str(exc)}
+
+    return snapshot if isinstance(snapshot, dict) else {"snapshot": snapshot}
+
+
+def compact_for_match(text: str) -> str:
+    return " ".join(text.split())
+
+
+def preview_for_log(text: str, max_chars: int = LOG_TEXT_PREVIEW_CHARS) -> str:
+    compacted = compact_for_match(text)
+    if len(compacted) <= max_chars:
+        return compacted
+
+    half = max(1, (max_chars - 3) // 2)
+    return f"{compacted[:half]}...{compacted[-half:]}"
+
+
+def independent_request_marker(text: str) -> str:
+    compacted = compact_for_match(text)
+    marker_start = compacted.find("【独立请求 ")
+    if marker_start < 0:
+        return ""
+
+    marker_end = compacted.find("】", marker_start)
+    if marker_end < 0:
+        return ""
+
+    return compacted[marker_start : marker_end + 1]
+
+
+def request_text_matches_user(sent_text: str, user_text: str) -> bool:
+    sent = compact_for_match(sent_text)
+    user = compact_for_match(user_text)
+    if not sent or not user:
+        return False
+
+    marker = independent_request_marker(sent)
+    if marker:
+        return marker in user
+
+    if sent == user or sent in user or user in sent:
+        return True
+
+    if len(sent) <= 120:
+        return sent in user
+
+    head = sent[:80]
+    tail = sent[-80:]
+    return head in user and tail in user
 
 
 def cleanup_chatgpt_text(text: str) -> str:
@@ -341,32 +678,222 @@ def cleanup_chatgpt_text(text: str) -> str:
     return "\n".join(line for line in lines if line.strip() not in ignored).strip()
 
 
-async def wait_for_response(page: Page, before_count: int, timeout_ms: int) -> str:
+async def wait_for_response(
+    page: Page,
+    before_count: int,
+    before_text: str,
+    sent_text: str,
+    timeout_ms: int,
+    conversation_key: str = "default",
+    log_label: str = "-",
+) -> str:
     """Wait for a new assistant answer and return its final stable text."""
+    started_at = time.monotonic()
     deadline = time.monotonic() + timeout_ms / 1000
     last_text = ""
     last_change_at = time.monotonic()
+    last_trace_log_at = 0.0
+    last_dom_snapshot_log_at = 0.0
+    last_trace_signature: tuple[Any, ...] | None = None
+    response_started = False
+    requires_user_match = bool(independent_request_marker(sent_text))
+    detailed_log(
+        (
+            "bridge.wait.start id=%s key=%s timeout_ms=%s before_count=%s "
+            "before_text_len=%s requires_marker=%s marker=%r sent_head=%r sent_tail=%r"
+        ),
+        log_label,
+        conversation_key,
+        timeout_ms,
+        before_count,
+        len(before_text),
+        requires_user_match,
+        independent_request_marker(sent_text),
+        preview_for_log(sent_text[:200]),
+        preview_for_log(sent_text[-200:]),
+    )
 
     while time.monotonic() < deadline:
-        text = await last_assistant_text(page)
+        current_state = await current_turn_response_state(page)
+        text = str(current_state.get("text") or "")
+        user_text = str(current_state.get("last_user_text") or "")
         count = await assistant_message_count(page)
+        user_matches = request_text_matches_user(sent_text, user_text)
+        current_user_ready = (
+            not current_state.get("last_user_is_existing", True)
+            and (
+                user_matches
+                or (not requires_user_match and bool(user_text))
+            )
+        )
+        current_turn_has_text = (
+            current_user_ready
+            and bool(current_state.get("has_assistant_after_last_user"))
+            and bool(text)
+        )
 
-        if count > before_count and text:
+        if not text and not current_user_ready:
+            text = await last_assistant_text(page)
+
+        has_new_response = (
+            current_turn_has_text
+            or count > before_count
+            or (text and text != before_text)
+        )
+        response_started = response_started or bool(has_new_response)
+        now = time.monotonic()
+        elapsed_seconds = now - started_at
+        if now - last_dom_snapshot_log_at >= RESPONSE_TRACE_LOG_INTERVAL_SECONDS:
+            last_dom_snapshot_log_at = now
+            snapshot = await chat_dom_snapshot(page)
+            detailed_log(
+                "bridge.dom.snapshot id=%s key=%s elapsed_ms=%.1f snapshot=%s",
+                log_label,
+                conversation_key,
+                elapsed_seconds * 1000,
+                json.dumps(snapshot, ensure_ascii=False),
+            )
+        if response_started and text:
             if text != last_text:
                 last_text = text
-                last_change_at = time.monotonic()
+                last_change_at = now
 
+            assistant_done = bool(current_state.get("assistant_done"))
+            if not current_turn_has_text:
+                assistant_done = await last_assistant_done_actions_visible(page)
             stop_button = await first_visible(page, STOP_BUTTON_SELECTORS)
-            response_is_stable = time.monotonic() - last_change_at >= 2.0
+            send_button = await first_visible(page, SEND_BUTTON_SELECTORS)
+            stable_seconds = now - last_change_at
+            response_is_stable = stable_seconds >= RESPONSE_STABLE_SECONDS
 
-            if response_is_stable and not stop_button:
+            response_looks_done = (
+                assistant_done
+                or not stop_button
+                or send_button
+                or stable_seconds >= RESPONSE_FORCE_RETURN_STABLE_SECONDS
+            )
+            trace_signature = (
+                response_started,
+                current_turn_has_text,
+                current_user_ready,
+                current_state.get("last_user_is_existing"),
+                user_matches,
+                bool(current_state.get("has_assistant_after_last_user")),
+                len(text),
+                count,
+                assistant_done,
+                bool(stop_button),
+                bool(send_button),
+                response_looks_done,
+            )
+            if (
+                trace_signature != last_trace_signature
+                or now - last_trace_log_at >= RESPONSE_TRACE_LOG_INTERVAL_SECONDS
+            ):
+                last_trace_signature = trace_signature
+                last_trace_log_at = now
+                detailed_log(
+                    (
+                        "bridge.wait.trace id=%s key=%s elapsed_ms=%.1f count=%s "
+                        "before_count=%s role_count=%s last_user_index=%s assistant_index=%s "
+                        "started=%s current_turn=%s user_ready=%s user_existing=%s "
+                        "user_matches=%s requires_marker=%s assistant_after_user=%s "
+                        "text_len=%s stable_seconds=%.1f assistant_done=%s "
+                        "stop_visible=%s send_visible=%s looks_done=%s "
+                        "last_user_head=%r assistant_head=%r assistant_tail=%r"
+                    ),
+                    log_label,
+                    conversation_key,
+                    elapsed_seconds * 1000,
+                    count,
+                    before_count,
+                    current_state.get("role_count"),
+                    current_state.get("last_user_index"),
+                    current_state.get("assistant_index"),
+                    response_started,
+                    current_turn_has_text,
+                    current_user_ready,
+                    current_state.get("last_user_is_existing"),
+                    user_matches,
+                    requires_user_match,
+                    current_state.get("has_assistant_after_last_user"),
+                    len(text),
+                    stable_seconds,
+                    assistant_done,
+                    bool(stop_button),
+                    bool(send_button),
+                    response_looks_done,
+                    preview_for_log(user_text),
+                    preview_for_log(text[:200]),
+                    preview_for_log(text[-200:]),
+                )
+            if response_is_stable and response_looks_done:
+                detailed_log(
+                    (
+                        "bridge.wait.return id=%s key=%s elapsed_ms=%.1f reply_len=%s "
+                        "stable_seconds=%.1f assistant_done=%s stop_visible=%s send_visible=%s"
+                    ),
+                    log_label,
+                    conversation_key,
+                    elapsed_seconds * 1000,
+                    len(last_text),
+                    stable_seconds,
+                    assistant_done,
+                    bool(stop_button),
+                    bool(send_button),
+                )
                 return last_text
+        elif now - last_trace_log_at >= RESPONSE_TRACE_LOG_INTERVAL_SECONDS:
+            last_trace_log_at = now
+            detailed_log(
+                (
+                    "bridge.wait.trace id=%s key=%s elapsed_ms=%.1f count=%s "
+                    "before_count=%s role_count=%s last_user_index=%s assistant_index=%s "
+                    "started=%s has_new_response=%s current_turn=%s user_ready=%s "
+                    "user_existing=%s user_matches=%s requires_marker=%s assistant_after_user=%s "
+                    "text_len=%s last_user_head=%r assistant_head=%r"
+                ),
+                log_label,
+                conversation_key,
+                elapsed_seconds * 1000,
+                count,
+                before_count,
+                current_state.get("role_count"),
+                current_state.get("last_user_index"),
+                current_state.get("assistant_index"),
+                response_started,
+                bool(has_new_response),
+                current_turn_has_text,
+                current_user_ready,
+                current_state.get("last_user_is_existing"),
+                user_matches,
+                requires_user_match,
+                current_state.get("has_assistant_after_last_user"),
+                len(text),
+                preview_for_log(user_text),
+                preview_for_log(text[:200]),
+            )
 
         await page.wait_for_timeout(700)
 
     if last_text:
+        detailed_log(
+            "bridge.wait.timeout_return_last id=%s key=%s reply_len=%s timeout_ms=%s",
+            log_label,
+            conversation_key,
+            len(last_text),
+            timeout_ms,
+        )
         return last_text
 
+    logger.error(
+        "bridge.wait.timeout_error id=%s key=%s timeout_ms=%s before_count=%s before_text_len=%s",
+        log_label,
+        conversation_key,
+        timeout_ms,
+        before_count,
+        len(before_text),
+    )
     raise ChatGPTBridgeError("等待 ChatGPT 输出超时。")
 
 
@@ -546,6 +1073,7 @@ class ChatGPTWebBridge:
         page: Page,
         conversation_key: str = "default",
         force_new_chat: bool = False,
+        log_label: str = "-",
     ) -> None:
         session = self._chat_sessions.setdefault(
             conversation_key,
@@ -554,9 +1082,36 @@ class ChatGPTWebBridge:
         session_url = str(session["url"]) if session.get("url") else None
         expired = self._chat_expired(conversation_key)
         target_url = self.chat_url if force_new_chat or expired or not session_url else session_url
+        detailed_log(
+            (
+                "bridge.chat.ensure id=%s key=%s force_new=%s expired=%s "
+                "current_url=%r target_url=%r session_url=%r started=%s"
+            ),
+            log_label,
+            conversation_key,
+            force_new_chat,
+            expired,
+            page.url,
+            target_url,
+            session_url,
+            bool(session.get("started_at")),
+        )
 
         if page.url != target_url:
+            detailed_log(
+                "bridge.chat.goto.start id=%s key=%s from_url=%r to_url=%r",
+                log_label,
+                conversation_key,
+                page.url,
+                target_url,
+            )
             await page.goto(target_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            detailed_log(
+                "bridge.chat.goto.done id=%s key=%s url=%r",
+                log_label,
+                conversation_key,
+                page.url,
+            )
 
         if force_new_chat or expired or not session.get("started_at"):
             session["started_at"] = time.monotonic()
@@ -567,6 +1122,7 @@ class ChatGPTWebBridge:
         images: list[Path] | None = None,
         conversation_key: str = "default",
         force_new_chat: bool = False,
+        log_label: str = "-",
     ) -> str:
         for attempt in range(2):
             try:
@@ -575,6 +1131,7 @@ class ChatGPTWebBridge:
                     images=images,
                     conversation_key=conversation_key,
                     force_new_chat=force_new_chat,
+                    log_label=log_label,
                 )
             except PlaywrightError as exc:
                 if attempt == 0 and self._is_closed_browser_error(exc):
@@ -590,27 +1147,72 @@ class ChatGPTWebBridge:
         images: list[Path] | None = None,
         conversation_key: str = "default",
         force_new_chat: bool = False,
+        log_label: str = "-",
     ) -> str:
         if not self._context:
             raise ChatGPTBridgeError("浏览器上下文尚未启动。")
 
+        detailed_log(
+            (
+                "bridge.ask.start id=%s key=%s force_new=%s images=%s text_chars=%s "
+                "marker=%r text_head=%r text_tail=%r"
+            ),
+            log_label,
+            conversation_key,
+            force_new_chat,
+            len(images or []),
+            len(text),
+            independent_request_marker(text),
+            preview_for_log(text[:200]),
+            preview_for_log(text[-200:]),
+        )
         page, should_close_page = await self._get_page(conversation_key=conversation_key)
+        detailed_log(
+            "bridge.page.selected id=%s key=%s should_close=%s url=%r",
+            log_label,
+            conversation_key,
+            should_close_page,
+            page.url,
+        )
 
         try:
             await self._ensure_active_chat(
                 page,
                 conversation_key=conversation_key,
                 force_new_chat=force_new_chat,
+                log_label=log_label,
             )
             await dismiss_blocking_modals(page)
 
             composer = await wait_for_composer(page, self.timeout_ms)
             before_count = await assistant_message_count(page)
+            before_text = await last_assistant_text(page)
+            marked_users = await mark_existing_user_messages(page)
+            detailed_log(
+                (
+                    "bridge.dom.before_send id=%s key=%s before_count=%s marked_users=%s "
+                    "before_text_len=%s before_text_head=%r url=%r"
+                ),
+                log_label,
+                conversation_key,
+                before_count,
+                marked_users,
+                len(before_text),
+                preview_for_log(before_text[:200]),
+                page.url,
+            )
 
             await attach_images(page, images or [], self.timeout_ms)
             await dismiss_blocking_modals(page)
             composer = await wait_for_composer(page, self.timeout_ms)
             await put_text_into_composer(page, composer, text)
+            detailed_log(
+                "bridge.composer.filled id=%s key=%s text_chars=%s images=%s",
+                log_label,
+                conversation_key,
+                len(text),
+                len(images or []),
+            )
             send_button = await wait_until_send_ready(page, self.timeout_ms)
             await dismiss_blocking_modals(page)
             try:
@@ -619,8 +1221,51 @@ class ChatGPTWebBridge:
                 await dismiss_blocking_modals(page)
                 send_button = await wait_until_send_ready(page, self.timeout_ms)
                 await send_button.click()
+            after_send_state = await current_turn_response_state(page)
+            after_send_user_text = str(after_send_state.get("last_user_text") or "")
+            detailed_log(
+                (
+                    "bridge.send.clicked id=%s key=%s url=%r role_count=%s "
+                    "last_user_index=%s assistant_index=%s user_existing=%s "
+                    "user_matches=%s assistant_after_user=%s assistant_text_len=%s "
+                    "last_user_head=%r assistant_head=%r"
+                ),
+                log_label,
+                conversation_key,
+                page.url,
+                after_send_state.get("role_count"),
+                after_send_state.get("last_user_index"),
+                after_send_state.get("assistant_index"),
+                after_send_state.get("last_user_is_existing"),
+                request_text_matches_user(text, after_send_user_text),
+                after_send_state.get("has_assistant_after_last_user"),
+                len(str(after_send_state.get("text") or "")),
+                preview_for_log(after_send_user_text),
+                preview_for_log(str(after_send_state.get("text") or "")),
+            )
+            detailed_log(
+                "bridge.dom.snapshot id=%s key=%s elapsed_ms=0.0 snapshot=%s",
+                log_label,
+                conversation_key,
+                json.dumps(await chat_dom_snapshot(page), ensure_ascii=False),
+            )
 
-            reply = await wait_for_response(page, before_count, self.timeout_ms)
+            reply = await wait_for_response(
+                page,
+                before_count,
+                before_text,
+                text,
+                self.timeout_ms,
+                conversation_key=conversation_key,
+                log_label=log_label,
+            )
+            detailed_log(
+                "bridge.ask.return id=%s key=%s reply_chars=%s url=%r",
+                log_label,
+                conversation_key,
+                len(reply),
+                page.url,
+            )
             self._chat_sessions.setdefault(
                 conversation_key,
                 {"url": None, "started_at": time.monotonic()},
